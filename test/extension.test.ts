@@ -5,6 +5,10 @@ import { join } from "node:path";
 import { afterEach, test } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import applyPatchExtension, { createApplyPatchTool } from "../src/index.ts";
+import {
+	renderApplyPatchCall,
+	renderApplyPatchResult,
+} from "../src/render.ts";
 
 const workspaces: string[] = [];
 
@@ -37,6 +41,11 @@ test("registers only the apply_patch tool", () => {
 	);
 });
 
+test("the registered tool uses its own renderer shell", () => {
+	const tool = createApplyPatchTool() as { renderShell?: string };
+	assert.equal(tool.renderShell, "self");
+});
+
 test("the registered tool executes patches and returns a concise result", async () => {
 	const cwd = await workspace();
 	const tool = createApplyPatchTool();
@@ -57,6 +66,81 @@ test("the registered tool executes patches and returns a concise result", async 
 		/Applied patch successfully to 1 file/,
 	);
 	assert.deepEqual(result.details.changedPaths, ["created.txt"]);
+	assert.equal(result.details.files[0]?.kind, "add");
+	assert.match(result.details.files[0]?.diff ?? "", /\+1 hello/);
+	assert.deepEqual(result.details.summary, {
+		files: 1,
+		additions: 1,
+		deletions: 0,
+	});
+});
+
+test("renders the call summary and file diff", async () => {
+	const cwd = await workspace();
+	const tool = createApplyPatchTool();
+	const input =
+		"*** Begin Patch\n*** Add File: created.txt\n+hello\n*** End Patch";
+	const result = await tool.execute(
+		"call-render",
+		{ input },
+		undefined,
+		undefined,
+		{ cwd },
+	);
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+		inverse: (text: string) => text,
+	} as never;
+
+	const call = renderApplyPatchCall({ input }, theme, { isError: false });
+	assert.match(call.render(120).join("\n"), /apply_patch/);
+	assert.match(call.render(120).join("\n"), /created\.txt/);
+
+	const rendered = renderApplyPatchResult(
+		result,
+		{ expanded: true, isPartial: false },
+		theme,
+		{ isError: false },
+	);
+	const output = rendered.render(120).join("\n");
+	assert.match(output, /add created\.txt/);
+	assert.match(output, /\+1 hello/);
+});
+
+test("collapses long diffs and exposes the full diff when expanded", () => {
+	const theme = {
+		fg: (_color: string, text: string) => text,
+		bold: (text: string) => text,
+		inverse: (text: string) => text,
+	} as never;
+	const diff = Array.from({ length: 50 }, (_, index) => `+${index + 1} line-${index}`).join("\n");
+	const result = {
+		content: [{ type: "text" as const, text: "Applied patch successfully" }],
+		details: {
+			operations: [{ kind: "add" as const, path: "large.txt" }],
+			changedPaths: ["large.txt"],
+			fuzzyMatches: [],
+			files: [{ path: "large.txt", kind: "add" as const, diff, additions: 50, deletions: 0 }],
+			summary: { files: 1, additions: 50, deletions: 0 },
+		},
+	};
+
+	const collapsed = renderApplyPatchResult(
+		result,
+		{ expanded: false, isPartial: false },
+		theme,
+		{ isError: false },
+	);
+	assert.match(collapsed.render(120).join("\n"), /expand to view/);
+
+	const expanded = renderApplyPatchResult(
+		result,
+		{ expanded: true, isPartial: false },
+		theme,
+		{ isError: false },
+	);
+	assert.match(expanded.render(120).join("\n"), /\+50 line-49/);
 });
 
 test("serializes concurrent apply_patch calls through one mutation queue", async () => {
@@ -97,6 +181,8 @@ test("source does not invoke Codex or any child process", async () => {
 		"parser.ts",
 		"errors.ts",
 		"types.ts",
+		"diff.ts",
+		"render.ts",
 	];
 	for (const file of sourceFiles) {
 		const source = await readFile(

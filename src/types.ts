@@ -54,8 +54,34 @@ export interface AppliedOperation {
 	destination?: string;
 }
 
+export type ApplyPatchFileKind = "add" | "update" | "delete";
+
+export interface ApplyPatchFileDiff {
+	path: string;
+	kind: ApplyPatchFileKind;
+	diff: string;
+	patch?: string;
+	firstChangedLine?: number;
+	additions: number;
+	deletions: number;
+	truncated?: boolean;
+	move?: {
+		from: string;
+		to: string;
+		role: "source" | "destination";
+	};
+}
+
+export interface ApplyPatchSummary {
+	files: number;
+	additions: number;
+	deletions: number;
+}
+
 export interface ApplyPatchResult {
 	operations: AppliedOperation[];
 	changedPaths: string[];
 	fuzzyMatches: FuzzyMatch[];
+	files: ApplyPatchFileDiff[];
+	summary: ApplyPatchSummary;
 }

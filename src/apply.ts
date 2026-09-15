@@ -1,4 +1,5 @@
 import { sep } from "node:path";
+import { buildApplyPatchDiffs } from "./diff.ts";
 import { asErrorMessage, PatchError } from "./errors.ts";
 import {
 	commitFileChanges,
@@ -279,10 +280,12 @@ class PatchPlanner {
 	}
 
 	result(changedPaths: string[]): ApplyPatchResult {
+		const details = buildApplyPatchDiffs(this.changes(), this.operations);
 		return {
 			operations: [...this.operations],
 			changedPaths,
 			fuzzyMatches: [...this.fuzzyMatches],
+			...details,
 		};
 	}
 

@@ -14,6 +14,8 @@
 - 限制写入当前工作区，阻止绝对路径、目录穿越和符号链接逃逸
 - 保留现有文本文件的 CRLF/LF 换行风格
 - 不修改二进制文件或非 UTF-8 文件
+- 工具结果包含每个文件的 line-numbered diff、unified patch 和增删统计
+- 在 Pi TUI 中按文件显示彩色修改差异，支持展开查看完整结果
 
 ## 安装
 
@@ -56,6 +58,26 @@ pi install 'D:\Pi Extensions\pi-apply-patch'
 ```
 
 所有路径都相对于当前 Pi 工作区。更新上下文必须唯一；找不到或存在歧义时，工具会失败且不会开始写入。
+
+执行结果的正文只包含简短摘要，结构化 `details` 中包含 `files` 和 `summary`：
+
+```json
+{
+  "files": [
+    {
+      "path": "src/example.ts",
+      "kind": "update",
+      "diff": " 1 const enabled = false;\n-2 const value = 0;\n+2 const value = 1;",
+      "patch": "--- src/example.ts\n+++ src/example.ts\n@@ -1,2 +1,2 @@\n const enabled = false;\n-const value = 0;\n+const value = 1;",
+      "additions": 1,
+      "deletions": 1
+    }
+  ],
+  "summary": { "files": 1, "additions": 1, "deletions": 1 }
+}
+```
+
+大 diff 会在展示详情中截断并标记 `truncated`，但文件写入仍使用完整补丁结果。
 
 ## 开发验证
 

@@ -76,13 +76,34 @@ test("applies add, update, delete, and move operations after a complete prefligh
 		]),
 	);
 	assert.equal(result.operations.length, 4);
+	assert.deepEqual(result.summary, {
+		files: 5,
+		additions: 4,
+		deletions: 3,
+	});
+	const diffs = new Map(result.files.map((file) => [file.path, file]));
+	assert.equal(diffs.get("source.txt")?.kind, "update");
+	assert.equal(diffs.get("source.txt")?.firstChangedLine, 3);
+	assert.match(diffs.get("source.txt")?.diff ?? "", /-3 value/);
+	assert.equal(diffs.get("delete.txt")?.kind, "delete");
+	assert.equal(diffs.get("nested/new.txt")?.kind, "add");
+	assert.deepEqual(diffs.get("move.txt")?.move, {
+		from: "move.txt",
+		to: "moved.txt",
+		role: "source",
+	});
+	assert.deepEqual(diffs.get("moved.txt")?.move, {
+		from: "move.txt",
+		to: "moved.txt",
+		role: "destination",
+	});
 });
 
 test("preserves an existing file's CRLF style", async () => {
 	const cwd = await workspace();
 	await writeFile(join(cwd, "windows.txt"), "one\r\ntwo\r\n", "utf8");
 
-	await applyPatch(
+	const result = await applyPatch(
 		`*** Begin Patch
 *** Update File: windows.txt
 @@
@@ -97,6 +118,24 @@ test("preserves an existing file's CRLF style", async () => {
 		await readFile(join(cwd, "windows.txt"), "utf8"),
 		"one\r\nsecond\r\n",
 	);
+	assert.equal(result.files[0]?.diff, " 1 one\n-2 two\n+2 second");
+});
+
+test("bounds large diff details without changing the committed file", async () => {
+	const cwd = await workspace();
+	const lines = Array.from({ length: 2_100 }, (_, index) => `+line-${index}`);
+	const result = await applyPatch(
+		`*** Begin Patch\n*** Add File: large.txt\n${lines.join("\n")}\n*** End Patch`,
+		cwd,
+	);
+
+	const file = result.files[0];
+	assert.equal(file?.truncated, true);
+	assert.equal(file?.patch, undefined);
+	assert.match(file?.diff ?? "", /diff truncated/);
+	assert.ok((file?.diff.split("\n").length ?? 0) <= 2_000);
+	assert.ok(Buffer.byteLength(file?.diff ?? "", "utf8") <= 64 * 1024);
+	assert.equal((await readFile(join(cwd, "large.txt"), "utf8")).split("\n").length, 2_101);
 });
 
 test("uses whitespace-tolerant matching only when the location is unique", async () => {
