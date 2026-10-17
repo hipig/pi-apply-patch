@@ -66,6 +66,7 @@ test("the registered tool executes patches and returns a concise result", async 
 		/Applied patch successfully to 1 file/,
 	);
 	assert.deepEqual(result.details.changedPaths, ["created.txt"]);
+	assert.equal(result.details.status, "complete");
 	assert.equal(result.details.files[0]?.kind, "add");
 	assert.match(result.details.files[0]?.diff ?? "", /\+1 hello/);
 	assert.deepEqual(result.details.summary, {
@@ -108,6 +109,95 @@ test("renders the call summary and file diff", async () => {
 	assert.match(output, /\+1 hello/);
 });
 
+test("reports all unapplied hunks and renders a warning alongside saved diffs", async () => {
+	const cwd = await workspace();
+	await writeFile(join(cwd, "value.txt"), "one\ntwo\n", "utf8");
+	const tool = createApplyPatchTool();
+	const result = await tool.execute(
+		"call-partial",
+		{
+			input: `*** Begin Patch
+*** Update File: value.txt
+@@
+-one
++ONE
+@@
+-missing
++ignored
+@@ missing-anchor
+-two
++ignored
+*** End Patch`,
+		},
+		undefined,
+		undefined,
+		{ cwd },
+	);
+	const text = result.content[0]?.text ?? "";
+	assert.equal(result.details.status, "partial");
+	assert.match(text, /Partially applied patch: 1 file saved/);
+	assert.match(text, /value\.txt: operation 1, hunk 2, patch line 6: context was not found/);
+	assert.match(text, /value\.txt: operation 1, hunk 3, patch line 9: anchor was not found/);
+	assert.match(text, /retry only unapplied changes/);
+	assert.doesNotMatch(text, /Applied patch successfully/);
+	assert.equal(await readFile(join(cwd, "value.txt"), "utf8"), "ONE\ntwo\n");
+
+	const colors: Array<{ color: string; text: string }> = [];
+	const theme = {
+		fg: (color: string, text: string) => {
+			colors.push({ color, text });
+			return text;
+		},
+		bold: (text: string) => text,
+		inverse: (text: string) => text,
+	} as never;
+	const rendered = renderApplyPatchResult(
+		result,
+		{ expanded: false, isPartial: false },
+		theme,
+		{ isError: false },
+	);
+	const output = rendered.render(120).join("\n");
+	assert.match(output, /hunk 2/);
+	assert.match(output, /hunk 3/);
+	assert.match(output, /\+1 ONE/);
+	assert.ok(colors.some((entry) => entry.color === "warning" && /Partially applied/.test(entry.text)));
+	assert.ok(!colors.some((entry) => entry.color === "success"));
+});
+
+test("throws a concise aggregate error when no changes can be applied", async () => {
+	const cwd = await workspace();
+	await writeFile(join(cwd, "value.txt"), "stable\n", "utf8");
+	const tool = createApplyPatchTool();
+	await assert.rejects(tool.execute(
+		"call-failed",
+		{
+			input: `*** Begin Patch
+*** Update File: value.txt
+@@
+-missing-one
++ignored
+@@
+-missing-two
++ignored
+*** Delete File: missing.txt
+*** End Patch`,
+		},
+		undefined,
+		undefined,
+		{ cwd },
+	), (error: unknown) => {
+		assert.ok(error instanceof Error);
+		assert.match(error.message, /Patch failed; no files changed/);
+		assert.match(error.message, /hunk 1/);
+		assert.match(error.message, /hunk 2/);
+		assert.match(error.message, /missing\.txt: operation 2/);
+		assert.doesNotMatch(error.message, /applied successfully/);
+		return true;
+	});
+	assert.equal(await readFile(join(cwd, "value.txt"), "utf8"), "stable\n");
+});
+
 test("collapses long diffs and exposes the full diff when expanded", () => {
 	const theme = {
 		fg: (_color: string, text: string) => text,
@@ -118,6 +208,8 @@ test("collapses long diffs and exposes the full diff when expanded", () => {
 	const result = {
 		content: [{ type: "text" as const, text: "Applied patch successfully" }],
 		details: {
+			status: "complete" as const,
+			outcomes: [{ operation: 1, kind: "add" as const, path: "large.txt", lineNumber: 2, status: "complete" as const, hunks: [] }],
 			operations: [{ kind: "add" as const, path: "large.txt" }],
 			changedPaths: ["large.txt"],
 			fuzzyMatches: [],
@@ -183,6 +275,7 @@ test("source does not invoke Codex or any child process", async () => {
 		"types.ts",
 		"diff.ts",
 		"render.ts",
+		"result.ts",
 	];
 	for (const file of sourceFiles) {
 		const source = await readFile(

@@ -1,20 +1,23 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { type ApplyPatchOptions, applyPatch } from "./apply.ts";
+import { PatchError } from "./errors.ts";
 import { renderApplyPatchCall, renderApplyPatchResult } from "./render.ts";
-import type { ApplyPatchResult } from "./types.ts";
+import { formatApplyPatchResult } from "./result.ts";
 
 export const APPLY_PATCH_DESCRIPTION = `Apply a patch to files in the current workspace.
 The input must use Codex patch format and be wrapped in *** Begin Patch / *** End Patch.
-Supported operations are Add File, Update File, Delete File, and Move to. Paths must be relative to the workspace.`;
+Supported operations are Add File, Update File, Delete File, and Move to. Paths must be relative to the workspace.
+Ordinary updates save matched hunks and report unmatched changes. A move is skipped in full if any of its hunks fail.`;
 
 export const APPLY_PATCH_PROMPT_SNIPPET =
-	"Apply one complete Codex-format patch across the requested workspace files.";
+	"Apply a Codex-format patch, saving matched hunks and reporting unapplied changes.";
 
 export const APPLY_PATCH_PROMPT_GUIDELINES = [
 	"Use one apply_patch call for related changes across multiple files.",
 	"Include the exact *** Begin Patch and *** End Patch envelope.",
 	"Do not edit or write the same files concurrently in the same turn.",
+	"After a partial result, read the current files and retry only unapplied changes; never resend the original patch.",
 ];
 
 export const APPLY_PATCH_PARAMETERS = Type.Object(
@@ -35,22 +38,6 @@ function enqueueMutation<T>(task: () => Promise<T>): Promise<T> {
 		() => undefined,
 	);
 	return result;
-}
-
-export function formatApplyPatchResult(result: ApplyPatchResult): string {
-	if (result.changedPaths.length === 0)
-		return "Patch applied successfully; no file content changed.";
-
-	const lines = [
-		`Applied patch successfully to ${result.changedPaths.length} file${result.changedPaths.length === 1 ? "" : "s"} (+${result.summary.additions} -${result.summary.deletions}):`,
-		...result.changedPaths.map((path) => `- ${path}`),
-	];
-	if (result.fuzzyMatches.length > 0) {
-		lines.push(
-			`Matched ${result.fuzzyMatches.length} hunk${result.fuzzyMatches.length === 1 ? "" : "s"} with whitespace tolerance.`,
-		);
-	}
-	return lines.join("\n");
 }
 
 export function createApplyPatchTool() {
@@ -76,9 +63,11 @@ export function createApplyPatchTool() {
 			const result = await enqueueMutation(() =>
 				applyPatch(params.input, context.cwd, options),
 			);
+			const text = formatApplyPatchResult(result);
+			if (result.status === "failed") throw new PatchError(text);
 			return {
 				content: [
-					{ type: "text" as const, text: formatApplyPatchResult(result) },
+					{ type: "text" as const, text },
 				],
 				details: result,
 			};
@@ -93,4 +82,13 @@ export default function applyPatchExtension(pi: ExtensionAPI): void {
 export { applyPatch } from "./apply.ts";
 export { PatchError } from "./errors.ts";
 export { parsePatch } from "./parser.ts";
-export type { ApplyPatchResult, ParsedPatch } from "./types.ts";
+export { formatApplyPatchResult } from "./result.ts";
+export type {
+	ApplyPatchResult,
+	HunkOutcome,
+	OperationOutcome,
+	ParsedPatch,
+	PatchFailure,
+	PatchFailureCode,
+	PatchStatus,
+} from "./types.ts";

@@ -6,6 +6,7 @@ import type {
 import { Container, Spacer, Text } from "@earendil-works/pi-tui";
 import * as Diff from "diff";
 import { parsePatch } from "./parser.ts";
+import { formatPatchSummary, formatUnappliedChanges } from "./result.ts";
 import type { ApplyPatchResult } from "./types.ts";
 
 export interface ApplyPatchArgs {
@@ -208,7 +209,9 @@ function contentText(result: AgentToolResult<unknown>): string {
 function isApplyPatchResult(value: unknown): value is ApplyPatchResult {
 	if (!value || typeof value !== "object") return false;
 	const candidate = value as Partial<ApplyPatchResult>;
-	return Array.isArray(candidate.files) && candidate.summary !== undefined;
+	return Array.isArray(candidate.files) && Array.isArray(candidate.outcomes) &&
+		candidate.summary !== undefined &&
+		(candidate.status === "complete" || candidate.status === "partial" || candidate.status === "failed");
 }
 
 function fileLabel(file: ApplyPatchResult["files"][number]): string {
@@ -243,18 +246,17 @@ export function renderApplyPatchResult(
 	if (_context.isError) return new Text(theme.fg("error", text), 0, 0);
 
 	const details = isApplyPatchResult(result.details) ? result.details : undefined;
-	if (details === undefined || details.files.length === 0) {
+	if (details === undefined) {
 		return new Text(text, 0, 0);
 	}
+	const color = details.status === "complete" ? "success"
+		: details.status === "partial" ? "warning" : "error";
+	if (details.files.length === 0) return new Text(theme.fg(color, text), 0, 0);
 
 	const container = new Container();
-	const summary = details.summary;
 	container.addChild(
 		new Text(
-			theme.fg(
-				"success",
-				`Applied ${summary.files} file${summary.files === 1 ? "" : "s"} (+${summary.additions} -${summary.deletions})`,
-			),
+			theme.fg(color, formatPatchSummary(details)),
 			0,
 			0,
 		),
@@ -270,6 +272,11 @@ export function renderApplyPatchResult(
 				0,
 			),
 		);
+	}
+	const unapplied = formatUnappliedChanges(details);
+	if (unapplied !== "") {
+		container.addChild(new Spacer(1));
+		container.addChild(new Text(theme.fg(color, unapplied), 0, 0));
 	}
 
 	let remaining = options.expanded ? Number.POSITIVE_INFINITY : COLLAPSED_DIFF_LINES;

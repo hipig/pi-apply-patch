@@ -1,6 +1,6 @@
 import { sep } from "node:path";
 import { buildApplyPatchDiffs } from "./diff.ts";
-import { asErrorMessage, PatchError } from "./errors.ts";
+import { asErrorMessage, HunkMatchError, PatchError } from "./errors.ts";
 import {
 	commitFileChanges,
 	type FileState,
@@ -15,9 +15,13 @@ import { parsePatch } from "./parser.ts";
 import type {
 	AppliedOperation,
 	ApplyPatchResult,
+	FilePatch,
 	FuzzyMatch,
+	HunkOutcome,
 	MatchMode,
+	OperationOutcome,
 	ParsedPatch,
+	PatchFailureCode,
 	UpdateFilePatch,
 	UpdateHunk,
 } from "./types.ts";
@@ -26,6 +30,12 @@ interface FileEntry {
 	path: ResolvedPatchPath;
 	before: FileState;
 	current: FileState;
+}
+
+interface PreparedOperation {
+	patch: FilePatch;
+	source: FileEntry;
+	destination?: FileEntry;
 }
 
 interface TextLines {
@@ -111,7 +121,10 @@ function findSequence(
 ): SequenceMatch {
 	const maximum = haystack.length - needle.length;
 	if (maximum < start)
-		throw new PatchError(`${description}: context was not found`);
+		throw new HunkMatchError(
+			"context_not_found",
+			`${description} was not found`,
+		);
 
 	for (const mode of ["exact", "rstrip", "trim"] as const) {
 		const candidates: number[] = [];
@@ -127,13 +140,17 @@ function findSequence(
 
 		if (candidates.length === 1) return { index: candidates[0] ?? start, mode };
 		if (candidates.length > 1) {
-			throw new PatchError(
-				`${description}: context is ambiguous (${candidates.length} matches)`,
+			throw new HunkMatchError(
+				"context_ambiguous",
+				`${description} is ambiguous (${candidates.length} matches)`,
 			);
 		}
 	}
 
-	throw new PatchError(`${description}: context was not found`);
+	throw new HunkMatchError(
+		"context_not_found",
+		`${description} was not found`,
+	);
 }
 
 function strongestMode(left: MatchMode, right: MatchMode): MatchMode {
@@ -142,66 +159,79 @@ function strongestMode(left: MatchMode, right: MatchMode): MatchMode {
 }
 
 function applyHunks(
-	path: string,
 	content: string,
 	hunks: UpdateHunk[],
-): { content: string; fuzzy: FuzzyMatch[] } {
-	if (hunks.length === 0) return { content, fuzzy: [] };
+): { content: string; hunks: HunkOutcome[] } {
+	if (hunks.length === 0) return { content, hunks: [] };
 
 	const text = splitText(content);
 	let cursor = 0;
-	const fuzzy: FuzzyMatch[] = [];
+	const outcomes: HunkOutcome[] = [];
 
 	for (const [hunkIndex, hunk] of hunks.entries()) {
-		const description = `${path}, hunk ${hunkIndex + 1}`;
-		let searchStart = cursor;
-		let matchMode: MatchMode = "exact";
+		try {
+			let searchStart = cursor;
+			let matchMode: MatchMode = "exact";
 
-		if (hunk.anchor !== undefined) {
-			const anchor = findSequence(
-				text.lines,
-				[hunk.anchor],
-				cursor,
-				false,
-				`${description} anchor`,
-			);
-			searchStart = anchor.index + 1;
-			matchMode = strongestMode(matchMode, anchor.mode);
-		}
-
-		const oldLines = hunk.lines
-			.filter((line) => line.kind !== "add")
-			.map((line) => line.text);
-		const newLines = hunk.lines
-			.filter((line) => line.kind !== "delete")
-			.map((line) => line.text);
-
-		let index: number;
-		if (oldLines.length === 0) {
-			index = hunk.endOfFile ? text.lines.length : searchStart;
-			if (index > text.lines.length)
-				throw new PatchError(
-					`${description}: insertion point is outside the file`,
+			if (hunk.anchor !== undefined) {
+				const anchor = findSequence(
+					text.lines,
+					[hunk.anchor],
+					cursor,
+					false,
+					"anchor",
 				);
-		} else {
-			const match = findSequence(
-				text.lines,
-				oldLines,
-				searchStart,
-				hunk.endOfFile,
-				description,
-			);
-			index = match.index;
-			matchMode = strongestMode(matchMode, match.mode);
-		}
+				searchStart = anchor.index + 1;
+				matchMode = strongestMode(matchMode, anchor.mode);
+			}
 
-		text.lines.splice(index, oldLines.length, ...newLines);
-		cursor = index + newLines.length;
-		if (matchMode !== "exact")
-			fuzzy.push({ path, hunk: hunkIndex + 1, mode: matchMode });
+			const oldLines = hunk.lines
+				.filter((line) => line.kind !== "add")
+				.map((line) => line.text);
+			const newLines = hunk.lines
+				.filter((line) => line.kind !== "delete")
+				.map((line) => line.text);
+
+			let index: number;
+			if (oldLines.length === 0) {
+				index = hunk.endOfFile ? text.lines.length : searchStart;
+				if (index > text.lines.length)
+					throw new HunkMatchError(
+						"insertion_out_of_bounds",
+						"insertion point is outside the file",
+					);
+			} else {
+				const match = findSequence(
+					text.lines,
+					oldLines,
+					searchStart,
+					hunk.endOfFile,
+					"context",
+				);
+				index = match.index;
+				matchMode = strongestMode(matchMode, match.mode);
+			}
+
+			text.lines.splice(index, oldLines.length, ...newLines);
+			cursor = index + newLines.length;
+			outcomes.push({
+				hunk: hunkIndex + 1,
+				lineNumber: hunk.lineNumber,
+				status: "applied",
+				mode: matchMode,
+			});
+		} catch (error) {
+			if (!(error instanceof HunkMatchError)) throw error;
+			outcomes.push({
+				hunk: hunkIndex + 1,
+				lineNumber: hunk.lineNumber,
+				status: "failed",
+				failure: { code: error.code, message: error.message },
+			});
+		}
 	}
 
-	return { content: joinText(text), fuzzy };
+	return { content: joinText(text), hunks: outcomes };
 }
 
 function throwIfAborted(signal: AbortSignal | undefined): void {
@@ -217,6 +247,8 @@ function throwIfAborted(signal: AbortSignal | undefined): void {
 class PatchPlanner {
 	private readonly entries = new Map<string, FileEntry>();
 	private readonly operations: AppliedOperation[] = [];
+	private readonly outcomes: OperationOutcome[] = [];
+	private readonly blockedPaths = new Map<string, number>();
 	private readonly fuzzyMatches: FuzzyMatch[] = [];
 	private readonly workspace: WorkspacePaths;
 	private readonly fileSystem: PatchFileSystem;
@@ -233,31 +265,82 @@ class PatchPlanner {
 	}
 
 	async plan(document: ParsedPatch): Promise<void> {
+		const prepared = await this.prepareOperations(document);
+		for (const [operationIndex, { patch, source, destination }] of prepared.entries()) {
+			throwIfAborted(this.signal);
+			const outcome: OperationOutcome = {
+				operation: operationIndex + 1,
+				kind: destination === undefined ? patch.kind : "move",
+				path: source.path.displayPath,
+				...(destination === undefined
+					? {}
+					: { destination: destination.path.displayPath }),
+				lineNumber: patch.lineNumber,
+				status: "complete",
+				hunks: patch.kind === "update"
+					? patch.hunks.map((hunk, index) => ({
+						hunk: index + 1,
+						lineNumber: hunk.lineNumber,
+						status: "blocked" as const,
+					}))
+					: [],
+			};
+			const blockedBy = this.blockedPaths.get(source.path.key) ??
+				(destination === undefined
+					? undefined
+					: this.blockedPaths.get(destination.path.key));
+
+			if (blockedBy !== undefined) {
+				this.rejectOperation(
+					outcome,
+					"blocked_by_previous_operation",
+					`not applied because operation ${blockedBy} did not complete`,
+					"blocked",
+				);
+			} else if (patch.kind === "add") {
+				if (source.current.exists) {
+					this.rejectOperation(outcome, "file_exists", "file already exists");
+				} else {
+					source.current = { exists: true, content: patch.content };
+					this.operations.push({ kind: "add", path: source.path.displayPath });
+				}
+			} else if (patch.kind === "delete") {
+				if (!source.current.exists) {
+					this.rejectOperation(outcome, "file_not_found", "file does not exist");
+				} else {
+					source.current = { exists: false };
+					this.operations.push({ kind: "delete", path: source.path.displayPath });
+				}
+			} else {
+				this.applyUpdate(patch, source, destination, outcome);
+			}
+
+			this.outcomes.push(outcome);
+			if (outcome.status !== "complete") {
+				for (const entry of destination === undefined ? [source] : [source, destination]) {
+					if (!this.blockedPaths.has(entry.path.key))
+						this.blockedPaths.set(entry.path.key, outcome.operation);
+				}
+			}
+		}
+	}
+
+	private async prepareOperations(document: ParsedPatch): Promise<PreparedOperation[]> {
+		const prepared: PreparedOperation[] = [];
+		// Validate every referenced path, including operations that may later be blocked.
 		for (const [operationIndex, operation] of document.files.entries()) {
 			throwIfAborted(this.signal);
 			try {
-				if (operation.kind === "add") {
-					const entry = await this.getEntry(operation.path);
-					if (entry.current.exists)
-						throw new PatchError(`file already exists: ${operation.path}`);
-					entry.current = { exists: true, content: operation.content };
-					this.operations.push({ kind: "add", path: entry.path.displayPath });
-					continue;
+				const source = await this.getEntry(operation.path);
+				const destination = operation.kind === "update" && operation.moveTo !== undefined
+					? await this.getEntry(operation.moveTo)
+					: undefined;
+				if (destination?.path.key === source.path.key) {
+					throw new PatchError(
+						`move destination resolves to the source file: ${destination.path.displayPath}`,
+					);
 				}
-
-				if (operation.kind === "delete") {
-					const entry = await this.getEntry(operation.path);
-					if (!entry.current.exists)
-						throw new PatchError(`file does not exist: ${operation.path}`);
-					entry.current = { exists: false };
-					this.operations.push({
-						kind: "delete",
-						path: entry.path.displayPath,
-					});
-					continue;
-				}
-
-				await this.applyUpdate(operation);
+				prepared.push({ patch: operation, source, destination });
 			} catch (error) {
 				if (error instanceof PatchError) {
 					throw new PatchError(
@@ -269,6 +352,7 @@ class PatchPlanner {
 		}
 
 		this.assertNoPathHierarchyConflicts();
+		return prepared;
 	}
 
 	changes(): PlannedFileChange[] {
@@ -282,6 +366,10 @@ class PatchPlanner {
 	result(changedPaths: string[]): ApplyPatchResult {
 		const details = buildApplyPatchDiffs(this.changes(), this.operations);
 		return {
+			status: this.outcomes.every((outcome) => outcome.status === "complete")
+				? "complete"
+				: this.operations.length > 0 ? "partial" : "failed",
+			outcomes: [...this.outcomes],
 			operations: [...this.operations],
 			changedPaths,
 			fuzzyMatches: [...this.fuzzyMatches],
@@ -289,17 +377,54 @@ class PatchPlanner {
 		};
 	}
 
-	private async applyUpdate(operation: UpdateFilePatch): Promise<void> {
-		const source = await this.getEntry(operation.path);
-		if (!source.current.exists)
-			throw new PatchError(`file does not exist: ${operation.path}`);
+	private rejectOperation(
+		outcome: OperationOutcome,
+		code: PatchFailureCode,
+		message: string,
+		status: "failed" | "blocked" = "failed",
+	): void {
+		outcome.status = status;
+		outcome.failure = { code, message };
+	}
+
+	private applyUpdate(
+		operation: UpdateFilePatch,
+		source: FileEntry,
+		destination: FileEntry | undefined,
+		outcome: OperationOutcome,
+	): void {
+		if (!source.current.exists) {
+			this.rejectOperation(outcome, "file_not_found", "file does not exist");
+			return;
+		}
+		if (destination?.current.exists) {
+			this.rejectOperation(outcome, "destination_exists", "move destination already exists");
+			return;
+		}
 
 		const updated = applyHunks(
-			source.path.displayPath,
 			source.current.content ?? "",
 			operation.hunks,
 		);
-		this.fuzzyMatches.push(...updated.fuzzy);
+		outcome.hunks = updated.hunks;
+		const hasFailures = updated.hunks.some((hunk) => hunk.status === "failed");
+		if (hasFailures && destination !== undefined) {
+			outcome.status = "failed";
+			outcome.hunks = updated.hunks.map((hunk) => hunk.status === "applied"
+				? { hunk: hunk.hunk, lineNumber: hunk.lineNumber, status: "blocked" }
+				: hunk);
+			return;
+		}
+		if (hasFailures && !updated.hunks.some((hunk) => hunk.status === "applied")) {
+			outcome.status = "failed";
+			return;
+		}
+
+		outcome.status = hasFailures ? "partial" : "complete";
+		for (const hunk of updated.hunks) {
+			if (hunk.status === "applied" && hunk.mode !== undefined && hunk.mode !== "exact")
+				this.fuzzyMatches.push({ path: source.path.displayPath, hunk: hunk.hunk, mode: hunk.mode });
+		}
 		const nextState: FileState = {
 			exists: true,
 			content: updated.content,
@@ -308,22 +433,11 @@ class PatchPlanner {
 				: { mode: source.current.mode }),
 		};
 
-		if (operation.moveTo === undefined) {
+		if (destination === undefined) {
 			source.current = nextState;
 			this.operations.push({ kind: "update", path: source.path.displayPath });
 			return;
 		}
-
-		const destination = await this.getEntry(operation.moveTo);
-		if (destination.path.key === source.path.key) {
-			throw new PatchError(
-				`move destination resolves to the source file: ${operation.moveTo}`,
-			);
-		}
-		if (destination.current.exists)
-			throw new PatchError(
-				`move destination already exists: ${operation.moveTo}`,
-			);
 
 		source.current = { exists: false };
 		destination.current = nextState;
